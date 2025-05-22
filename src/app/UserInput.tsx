@@ -1,7 +1,8 @@
 "use client";
 
-import TextField from "@mui/material/TextField";
 import Stack from "@mui/material/Stack";
+import TextField from "@mui/material/TextField";
+import ollama from "ollama/browser";
 
 function AssistantSelect() {
 	return (
@@ -15,11 +16,18 @@ function AssistantSelect() {
 }
 
 export default function UserInput() {
-	const handleCtrlEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
+	const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
 		if (event.ctrlKey && event.key === "Enter") {
 			event.preventDefault();
-			// TODO: メッセージ送信処理をここに実装
-			console.log("Ctrl+Enter pressed");
+			// メッセージを送信する
+			(async () => {
+				console.log("request chat");
+				const response = await ollama.chat({
+					model: "gemma3:4b",
+					messages: [{ role: "user", content: "Why is the sky blue?" }],
+				});
+				console.log(response);
+			})();
 		}
 	};
 
@@ -30,7 +38,7 @@ export default function UserInput() {
 				label="新しいメッセージ (Ctrl+Enter)"
 				variant="outlined"
 				multiline
-				onKeyDown={handleCtrlEnter}
+				onKeyDown={handleKeyDown}
 			/>
 			<AssistantSelect />
 		</Stack>
