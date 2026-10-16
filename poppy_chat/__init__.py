@@ -1,0 +1,1 @@
+"""Poppy Chat application."""
