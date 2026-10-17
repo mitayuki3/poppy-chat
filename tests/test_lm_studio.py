@@ -146,6 +146,7 @@ def test_stream_reply_sends_reasoning_and_previous_response_id() -> None:
             message="How are you?",
             previous_response_id="resp-previous",
             reasoning="off",
+            system_prompt="Answer concisely.",
         )
     )
 
@@ -161,6 +162,7 @@ def test_stream_reply_sends_reasoning_and_previous_response_id() -> None:
         "stream": True,
         "reasoning": "off",
         "previous_response_id": "resp-previous",
+        "system_prompt": "Answer concisely.",
     }
     assert client.closed
 
@@ -179,6 +181,22 @@ def test_stream_reply_omits_reasoning_for_auto_mode() -> None:
 
     assert client.post_json is not None
     assert "reasoning" not in client.post_json
+
+
+def test_stream_reply_omits_empty_system_prompt() -> None:
+    service, client = make_service(lines=sse("chat.end", {"result": {}}))
+
+    list(
+        service.stream_reply(
+            api_host="localhost:1234",
+            model_id="qwen-7b",
+            message="Hello",
+            system_prompt="  ",
+        )
+    )
+
+    assert client.post_json is not None
+    assert "system_prompt" not in client.post_json
 
 
 def test_stream_reply_raises_error_events() -> None:

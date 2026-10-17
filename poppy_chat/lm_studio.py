@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_API_HOST = "localhost:1234"
 AUTO_REASONING = "auto"
+DEFAULT_REASONING = "off"
 REASONING_OPTIONS = {"off", "on", "low", "medium", "high"}
 
 
@@ -98,6 +99,7 @@ class LMStudioService:
         message: str,
         previous_response_id: str | None = None,
         reasoning: str = AUTO_REASONING,
+        system_prompt: str = "",
     ) -> Iterator[ChatStreamEvent]:
         """Stream visible message deltas and return the final response ID."""
         if not model_id:
@@ -112,6 +114,8 @@ class LMStudioService:
             request["reasoning"] = reasoning
         if previous_response_id:
             request["previous_response_id"] = previous_response_id
+        if system_prompt.strip():
+            request["system_prompt"] = system_prompt
 
         with self._new_client(api_host) as client:
             with client.stream("POST", "/api/v1/chat", json=request) as response:
