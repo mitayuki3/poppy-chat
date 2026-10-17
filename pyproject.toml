@@ -6,7 +6,21 @@ requires-python = ">=3.13"
 dependencies = [
     "gradio>=6.7",
     "httpx>=0.28.1",
+    "irodori-tts[cu128]",
 ]
+
+[tool.uv.sources]
+irodori-tts = { git = "https://github.com/Aratako/Irodori-TTS", rev = "main" }
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+override-dependencies = ["sentencepiece>=0.2.2"]
 
 [dependency-groups]
 dev = [

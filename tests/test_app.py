@@ -2,6 +2,7 @@ from collections.abc import Iterator
 import inspect
 
 from poppy_chat.app import build_app, chat_response, refresh_models
+from poppy_chat.irodori_tts import DEFAULT_CHECKPOINT, NO_VOICE_OPTION
 from poppy_chat.lm_studio import ChatStreamEvent, LoadedModel
 
 
@@ -36,6 +37,21 @@ class FakeService:
         yield ChatStreamEvent(content="Hi")
         yield ChatStreamEvent(content=" there")
         yield ChatStreamEvent(response_id="resp-next")
+
+
+class FakeTTSService:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.error = error
+
+    def voice_choices(self) -> list[str]:
+        return [NO_VOICE_OPTION, "sample.wav"]
+
+    def synthesize(self, text: str, **kwargs) -> str:
+        self.calls.append((text, kwargs))
+        if self.error:
+            raise self.error
+        return "C:/tts-output/reply.wav"
 
 
 def test_refresh_models_returns_choices_and_reasoning_options() -> None:
@@ -185,7 +201,7 @@ def test_chat_response_prompts_for_model_selection() -> None:
 
 
 def test_build_app_returns_gradio_blocks_with_generator_callback() -> None:
-    app = build_app(service=FakeService())
+    app = build_app(service=FakeService(), tts_service=FakeTTSService())
 
     assert app.__class__.__name__ == "Blocks"
     respond = next(
@@ -197,7 +213,7 @@ def test_build_app_returns_gradio_blocks_with_generator_callback() -> None:
 
 
 def test_build_app_refreshes_models_when_browser_loads() -> None:
-    app = build_app(service=FakeService())
+    app = build_app(service=FakeService(), tts_service=FakeTTSService())
     function_indexes = {
         index
         for index, block_fn in app.fns.items()
@@ -214,7 +230,7 @@ def test_build_app_refreshes_models_when_browser_loads() -> None:
 
 def test_model_and_reasoning_choices_use_the_same_loaded_model_data() -> None:
     service = FakeService()
-    app = build_app(service=service)
+    app = build_app(service=service, tts_service=FakeTTSService())
     update_choices = next(
         inspect.unwrap(block_fn.fn)
         for block_fn in app.fns.values()
@@ -242,7 +258,7 @@ def test_model_and_reasoning_choices_use_the_same_loaded_model_data() -> None:
 
 
 def test_reasoning_ui_starts_with_off_selected() -> None:
-    app = build_app(service=FakeService())
+    app = build_app(service=FakeService(), tts_service=FakeTTSService())
     reasoning = next(
         component
         for component in app.blocks.values()
@@ -255,7 +271,7 @@ def test_reasoning_ui_starts_with_off_selected() -> None:
 
 def test_model_selection_uses_cached_models_instead_of_refetching() -> None:
     service = FakeService()
-    app = build_app(service=service)
+    app = build_app(service=service, tts_service=FakeTTSService())
     update_choices = next(
         inspect.unwrap(block_fn.fn)
         for block_fn in app.fns.values()
@@ -299,7 +315,9 @@ def test_build_app_refreshes_presets_when_browser_loads() -> None:
             return self.presets.copy()
 
     store = MutablePresetStore()
-    app = build_app(service=FakeService(), preset_store=store)
+    app = build_app(
+        service=FakeService(), preset_store=store, tts_service=FakeTTSService()
+    )
     refresh = next(
         inspect.unwrap(block_fn.fn)
         for block_fn in app.fns.values()
@@ -313,3 +331,116 @@ def test_build_app_refreshes_presets_when_browser_loads() -> None:
     assert choices_update["choices"] == ["Saved preset"]
     assert choices_update["value"] is None
     assert status == ""
+
+
+def test_respond_completes_before_queuing_audio_generation() -> None:
+    tts_service = FakeTTSService()
+    app = build_app(service=FakeService(), tts_service=tts_service)
+    respond = next(
+        inspect.unwrap(block_fn.fn)
+        for block_fn in app.fns.values()
+        if getattr(inspect.unwrap(block_fn.fn), "__name__", "") == "respond"
+    )
+
+    result = list(
+        respond(
+            "hello",
+            [],
+            "localhost:1234",
+            "qwen-7b",
+            "off",
+            None,
+            "",
+            True,
+        )
+    )
+
+    assert result[-1] == (
+        "Hi there",
+        {
+            "response_id": "resp-next",
+            "api_host": "localhost:1234",
+            "model_id": "qwen-7b",
+        },
+        {"response_id": "resp-next", "text": "Hi there"},
+    )
+    assert tts_service.calls == []
+
+    synthesize_response = next(
+        inspect.unwrap(block_fn.fn)
+        for block_fn in app.fns.values()
+        if getattr(inspect.unwrap(block_fn.fn), "__name__", "")
+        == "synthesize_response"
+    )
+    audio_result = list(
+        synthesize_response(
+            result[-1][2], DEFAULT_CHECKPOINT, NO_VOICE_OPTION, None, 3, 3, 5,
+            "", "ogg", None, [],
+        )
+    )
+
+    assert audio_result[0][2] == "音声を生成しています…"
+    assert audio_result[-1] == (
+        [{"text": "Hi there", "path": "C:/tts-output/reply.wav"}],
+        "C:/tts-output/reply.wav",
+        "読み上げを生成しました。",
+        ["C:/tts-output/reply.wav"],
+    )
+    assert tts_service.calls == [
+        (
+            "Hi there",
+            {
+                "checkpoint": DEFAULT_CHECKPOINT,
+                "voice_name": NO_VOICE_OPTION,
+                "num_steps": None,
+                "cfg_scale_text": 3,
+                "cfg_scale_caption": 3,
+                "cfg_scale_speaker": 5,
+                "caption": "",
+                "seed": None,
+                "output_format": "ogg",
+            },
+        )
+    ]
+
+
+def test_audio_generation_error_keeps_completed_answer() -> None:
+    tts_service = FakeTTSService(error=RuntimeError("model unavailable"))
+    app = build_app(service=FakeService(), tts_service=tts_service)
+    synthesize_response = next(
+        inspect.unwrap(block_fn.fn)
+        for block_fn in app.fns.values()
+        if getattr(inspect.unwrap(block_fn.fn), "__name__", "")
+        == "synthesize_response"
+    )
+
+    result = list(
+        synthesize_response(
+            {"response_id": "resp-next", "text": "Hi there"},
+            DEFAULT_CHECKPOINT, NO_VOICE_OPTION, None, 3, 3, 5,
+            "", "ogg", None, [],
+        )
+    )
+
+    assert "model unavailable" in result[-1][2]
+    assert result[-1][0] == []
+
+
+def test_respond_skips_tts_when_auto_read_is_disabled() -> None:
+    tts_service = FakeTTSService()
+    app = build_app(service=FakeService(), tts_service=tts_service)
+    respond = next(
+        inspect.unwrap(block_fn.fn)
+        for block_fn in app.fns.values()
+        if getattr(inspect.unwrap(block_fn.fn), "__name__", "") == "respond"
+    )
+
+    result = list(
+        respond(
+            "hello", [], "localhost:1234", "qwen-7b", "off", None, "", False,
+        )
+    )
+
+    assert result[-1][0] == "Hi there"
+    assert result[-1][2] is None
+    assert tts_service.calls == []

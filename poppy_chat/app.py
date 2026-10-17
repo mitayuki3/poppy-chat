@@ -11,6 +11,14 @@ from .lm_studio import (
     LMStudioService,
     LoadedModel,
 )
+from .irodori_tts import (
+    CHECKPOINT_CHOICES,
+    DEFAULT_OUTPUT_FORMAT,
+    DEFAULT_CHECKPOINT,
+    NO_VOICE_OPTION,
+    OUTPUT_FORMATS,
+    IrodoriTTSService,
+)
 from .system_prompts import SystemPromptPresetStore
 
 
@@ -166,15 +174,29 @@ def chat_response(
         yield response_text + detail, current_state
 
 
+def _optional_int(value: int | float | str | None, label: str) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label}には整数を入力してください。") from error
+    if not number.is_integer():
+        raise ValueError(f"{label}には整数を入力してください。")
+    return int(number)
+
+
 def build_app(
     service: LMStudioService | None = None,
     preset_store: SystemPromptPresetStore | None = None,
+    tts_service: IrodoriTTSService | None = None,
 ):
     """Create the Gradio app."""
     import gradio as gr
 
     service = service or LMStudioService()
     preset_store = preset_store or SystemPromptPresetStore()
+    tts_service = tts_service or IrodoriTTSService()
     auto_reasoning_choices = [
         *_reasoning_choices([], None),
         (DEFAULT_REASONING, DEFAULT_REASONING),
@@ -209,10 +231,28 @@ def build_app(
             [],
             [],
             None,
+            [],
+            None,
+            "",
+            [],
         )
 
     def reset_chat():
-        return [], [], [], None
+        return [], [], [], None, [], None, "", []
+
+    def update_voice_choices(selected_voice: str | None):
+        choices = tts_service.voice_choices()
+        value = selected_voice if selected_voice in choices else NO_VOICE_OPTION
+        return gr.update(choices=choices, value=value), f"参照音声 {len(choices) - 1}件"
+
+    def preload_tts_model(auto_read_enabled: bool, checkpoint: str):
+        if not auto_read_enabled:
+            return ""
+        try:
+            tts_service.load_model(checkpoint)
+        except Exception as error:
+            return f"起動時にIrodori-TTSモデルをロードできませんでした: {error}"
+        return f"Irodori-TTSモデルをロードしました: `{checkpoint}`"
 
     def respond(
         message: str,
@@ -222,8 +262,11 @@ def build_app(
         reasoning: str,
         conversation_state: ConversationState | None,
         system_prompt: str,
+        auto_read: bool,
     ):
-        yield from chat_response(
+        current_state = conversation_state
+        response_text = ""
+        for response_text, current_state in chat_response(
             message,
             history,
             api_host,
@@ -232,6 +275,79 @@ def build_app(
             conversation_state,
             system_prompt,
             service=service,
+        ):
+            yield response_text, current_state, None
+
+        has_new_response = bool(
+            current_state
+            and current_state.get("response_id")
+            and response_text.strip()
+            and "LM Studioに接続できません:" not in response_text
+            and (
+                not conversation_state
+                or current_state["response_id"] != conversation_state["response_id"]
+            )
+        )
+        tts_request = None
+        if auto_read and has_new_response:
+            tts_request = {
+                "response_id": current_state["response_id"],
+                "text": response_text,
+            }
+        yield response_text, current_state, tts_request
+
+    def synthesize_response(
+        request: dict[str, str] | None,
+        checkpoint: str,
+        voice_name: str,
+        num_steps: int | float | None,
+        cfg_scale_text: float,
+        cfg_scale_caption: float,
+        cfg_scale_speaker: float,
+        caption: str,
+        output_format: str,
+        seed: int | float | None,
+        audio_history: list[dict[str, str]] | None,
+    ):
+        if not request:
+            return
+
+        saved_audio = list(audio_history or [])
+        yield (
+            saved_audio,
+            gr.update(),
+            "音声を生成しています…",
+            [item["path"] for item in saved_audio],
+        )
+        try:
+            requested_steps = _optional_int(num_steps, "ステップ数")
+            generated_audio = tts_service.synthesize(
+                request["text"],
+                checkpoint=checkpoint,
+                voice_name=voice_name,
+                num_steps=requested_steps,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                caption=caption,
+                seed=_optional_int(seed, "seed"),
+                output_format=output_format,
+            )
+        except Exception as error:
+            yield (
+                saved_audio,
+                gr.update(),
+                f"読み上げを生成できませんでした: {error}",
+                [item["path"] for item in saved_audio],
+            )
+            return
+
+        saved_audio.append({"text": request["text"], "path": generated_audio})
+        yield (
+            saved_audio,
+            generated_audio,
+            "読み上げを生成しました。",
+            [item["path"] for item in saved_audio],
         )
 
     def load_system_prompt_preset(name: str | None):
@@ -301,6 +417,62 @@ def build_app(
             render=False,
         )
         conversation_state = gr.State(value=None)
+        audio_history_state = gr.State(value=[])
+        tts_request_state = gr.State(value=None)
+        with gr.Accordion("Irodori-TTS 読み上げ設定", open=False):
+            auto_read = gr.Checkbox(label="回答を自動で読み上げる", value=True)
+            checkpoint = gr.Dropdown(
+                label="モデル",
+                choices=CHECKPOINT_CHOICES,
+                value=DEFAULT_CHECKPOINT,
+            )
+            with gr.Row():
+                voice_name = gr.Dropdown(
+                    label="参照音声",
+                    choices=tts_service.voice_choices(),
+                    value=NO_VOICE_OPTION,
+                    interactive=True,
+                )
+                refresh_voices_button = gr.Button("参照音声一覧を更新", variant="secondary")
+            voice_status = gr.Markdown("voicesディレクトリの音声ファイルを使用できます。")
+            caption = gr.Textbox(
+                label="Voice Design キャプション（任意）",
+                placeholder="例: 落ち着いた自然な声で、やわらかく話す",
+                lines=2,
+            )
+            output_format = gr.Radio(
+                label="出力形式",
+                choices=OUTPUT_FORMATS,
+                value=DEFAULT_OUTPUT_FORMAT,
+            )
+            with gr.Row():
+                num_steps = gr.Number(
+                    label="ステップ数（空欄でモデル既定値）",
+                    value=20,
+                    minimum=1,
+                    maximum=100,
+                    precision=0,
+                )
+                seed = gr.Number(label="Seed（空欄でランダム）", value=None, precision=0)
+            with gr.Row():
+                cfg_scale_text = gr.Slider(
+                    label="Text CFG Scale", minimum=0, maximum=10, value=3, step=0.25
+                )
+                cfg_scale_caption = gr.Slider(
+                    label="Caption CFG Scale", minimum=0, maximum=10, value=3, step=0.25
+                )
+                cfg_scale_speaker = gr.Slider(
+                    label="Speaker CFG Scale", minimum=0, maximum=10, value=3, step=0.25
+                )
+        latest_audio = gr.Audio(
+            label="最新の読み上げ",
+            value=None,
+            type="filepath",
+            interactive=False,
+            autoplay=True,
+        )
+        tts_status = gr.Markdown()
+        audio_history_files = gr.Files(label="読み上げ履歴", file_count="multiple")
         with gr.Column(elem_classes="poppy-chatinterface"):
             chat = gr.ChatInterface(
                 fn=respond,
@@ -310,11 +482,40 @@ def build_app(
                     reasoning,
                     conversation_state,
                     system_prompt,
+                    auto_read,
                 ],
-                additional_outputs=[conversation_state],
+                additional_outputs=[
+                    conversation_state,
+                    tts_request_state,
+                ],
                 title="Poppy Chat",
                 analytics_enabled=False,
+                concurrency_limit=1,
             )
+        tts_request_state.change(
+            fn=synthesize_response,
+            inputs=[
+                tts_request_state,
+                checkpoint,
+                voice_name,
+                num_steps,
+                cfg_scale_text,
+                cfg_scale_caption,
+                cfg_scale_speaker,
+                caption,
+                output_format,
+                seed,
+                audio_history_state,
+            ],
+            outputs=[
+                audio_history_state,
+                latest_audio,
+                tts_status,
+                audio_history_files,
+            ],
+            concurrency_limit=1,
+            api_visibility="undocumented",
+        )
 
         with gr.Row():
             refresh_button = gr.Button("モデル一覧を更新", variant="secondary")
@@ -326,10 +527,34 @@ def build_app(
             inputs=[api_host, model_id],
             outputs=[model_id, reasoning, status, loaded_models_state],
         )
+        refresh_voices_button.click(
+            fn=update_voice_choices,
+            inputs=voice_name,
+            outputs=[voice_name, voice_status],
+            api_visibility="undocumented",
+        )
         app.load(
             fn=update_model_choices,
             inputs=[api_host, model_id],
             outputs=[model_id, reasoning, status, loaded_models_state],
+            api_visibility="undocumented",
+        )
+        app.load(
+            fn=preload_tts_model,
+            inputs=[auto_read, checkpoint],
+            outputs=tts_status,
+            api_visibility="undocumented",
+        )
+        auto_read.change(
+            fn=preload_tts_model,
+            inputs=[auto_read, checkpoint],
+            outputs=tts_status,
+            api_visibility="undocumented",
+        )
+        checkpoint.change(
+            fn=preload_tts_model,
+            inputs=[auto_read, checkpoint],
+            outputs=tts_status,
             api_visibility="undocumented",
         )
 
@@ -378,8 +603,14 @@ def build_app(
                 api_visibility="undocumented",
             )
         chat.chatbot.clear(
-            fn=lambda: None,
-            outputs=conversation_state,
+            fn=lambda: (None, [], None, "", []),
+            outputs=[
+                conversation_state,
+                audio_history_state,
+                latest_audio,
+                tts_status,
+                audio_history_files,
+            ],
             api_visibility="undocumented",
             queue=False,
         )
@@ -392,6 +623,10 @@ def build_app(
                 chat.chatbot_state,
                 chat.chatbot_value,
                 conversation_state,
+                audio_history_state,
+                latest_audio,
+                tts_status,
+                audio_history_files,
             ],
             api_visibility="undocumented",
         )
@@ -402,6 +637,10 @@ def build_app(
                 chat.chatbot_state,
                 chat.chatbot_value,
                 conversation_state,
+                audio_history_state,
+                latest_audio,
+                tts_status,
+                audio_history_files,
             ],
             api_visibility="undocumented",
         )
@@ -410,10 +649,13 @@ def build_app(
 
 
 def main() -> None:
-    build_app().launch(
+    tts_service = IrodoriTTSService()
+    tts_service.ensure_directories()
+    build_app(tts_service=tts_service).launch(
         server_name="127.0.0.1",
         inbrowser=True,
         share=False,
+        allowed_paths=[str(tts_service.output_dir), str(tts_service.voices_dir)],
         css="""
         .poppy-chatinterface,
         .poppy-chatinterface * {
